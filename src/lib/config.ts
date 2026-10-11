@@ -1,6 +1,6 @@
 export const API_BASE =
   import.meta.env.VITE_API_URL ||
-  'http://localhost:8000';
+  'https://beats-v3-backend.onrender.com';
 
 export const GENRES = [
   { id: 'all', label: 'ALL' },
