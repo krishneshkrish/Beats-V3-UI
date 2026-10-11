@@ -10,7 +10,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "devDependencies": {
     "@sveltejs/adapter-vercel": "^5.5.3",
