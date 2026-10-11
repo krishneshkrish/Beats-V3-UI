@@ -5,12 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev --host",
-    "build": "vite build",
+    "build": "svelte-kit sync && vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "devDependencies": {
-    "@sveltejs/adapter-auto": "^3.3.1",
+    "@sveltejs/adapter-vercel": "^5.5.3",
     "@sveltejs/kit": "^2.16.1",
     "@sveltejs/vite-plugin-svelte": "^3.1.2",
     "svelte": "^4.2.19",
