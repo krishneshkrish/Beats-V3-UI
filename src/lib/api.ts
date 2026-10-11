@@ -1,4 +1,4 @@
-﻿import { API_BASE } from './config';
+import { API_BASE } from './config';
 import type { Song, UserStats } from './types';
 
 // in-memory search cache
@@ -148,6 +148,35 @@ export async function getSongs(genre?: string, limit = 20): Promise<Song[]> {
   return SAMPLE_SONGS.slice(0, limit);
 }
 
+function normalizeSongList(data: any): Song[] {
+  if (!data) return [];
+  let rawList: any[] = [];
+  if (Array.isArray(data)) {
+    rawList = data;
+  } else if (Array.isArray(data.songs)) {
+    rawList = data.songs;
+  } else if (Array.isArray(data.results)) {
+    rawList = data.results;
+  } else if (Array.isArray(data.queue)) {
+    rawList = data.queue;
+  } else if (Array.isArray(data.data)) {
+    rawList = data.data;
+  }
+
+  return rawList.map((item, idx) => ({
+    id: String(item.id || item.song_id || `track-${idx}`),
+    title: String(item.title || item.name || 'Unknown Track'),
+    artist: String(item.artist || item.singers || 'Unknown Artist'),
+    film: item.film || item.album || undefined,
+    genre: String(item.genre || 'mix').toLowerCase(),
+    language: item.language || undefined,
+    duration: Number(item.duration) || 180,
+    thumbnail_url: item.thumbnail_url || item.thumbnail || item.image || undefined,
+    play_count: Number(item.play_count) || 0,
+    status: item.status || 'available'
+  }));
+}
+
 export async function searchSongs(query: string, limit = 20): Promise<Song[]> {
   if (!query || query.trim().length < 2) return [];
 
@@ -163,11 +192,12 @@ export async function searchSongs(query: string, limit = 20): Promise<Song[]> {
     );
     if (r.ok) {
       const data = await r.json();
-      const songs = data.songs || [];
+      const songs = normalizeSongList(data);
       if (songs.length > 0) {
         searchCache.set(key, songs);
         return songs;
       }
+      return [];
     }
   } catch (err) {
     // Backend offline / error fallback
@@ -226,8 +256,9 @@ export async function getTrending(genre?: string): Promise<Song[]> {
     const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (r.ok) {
       const data = await r.json();
-      if (Array.isArray(data.songs) && data.songs.length > 0) {
-        return data.songs;
+      const songs = normalizeSongList(data);
+      if (songs.length > 0) {
+        return songs;
       }
     }
   } catch (err) {}
@@ -252,8 +283,9 @@ export async function getRecommendations(userId: string): Promise<RecommendedSon
     const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (r.ok) {
       const data = await r.json();
-      if (Array.isArray(data.songs) && data.songs.length > 0) {
-        const list = [...data.songs] as RecommendedSongs;
+      const songs = normalizeSongList(data);
+      if (songs.length > 0) {
+        const list = [...songs] as RecommendedSongs;
         list.time_block = data.time_block;
         list.block_name = data.block_name;
         list.block_tag = data.block_tag;
@@ -279,8 +311,9 @@ export async function getRadio(
     const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (r.ok) {
       const data = await r.json();
-      if (Array.isArray(data.songs) && data.songs.length > 0) {
-        return data.songs;
+      const songs = normalizeSongList(data);
+      if (songs.length > 0) {
+        return songs;
       }
     }
   } catch (err) {

@@ -53,18 +53,26 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   } else {
     // Zero-friction Up Next: Seed infinite smart radio, excluding recent history to prevent 2-song loops
     const excludeList = [song.id, ...get(history).map(s => s.id)];
-    getRadio(song.id, getLocalUserId(), 15, excludeList).then(radioSongs => {
-      const remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+    getRadio(song.id, getLocalUserId(), 15, excludeList).then(async radioSongs => {
+      let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+      if (remaining.length === 0) {
+        // Fallback: If strict exclusion emptied radio, grab trending or recommendations
+        const recList = await getRecommendations(getLocalUserId());
+        remaining = recList.filter(s => s.id !== song.id);
+      }
+      if (remaining.length === 0) {
+        const trendList = await getTrending(song.genre);
+        remaining = trendList.filter(s => s.id !== song.id);
+      }
       if (remaining.length > 0) {
         queue.set(remaining);
       }
-    }).catch(() => {
-      getRecommendations(getLocalUserId()).then(recList => {
-        const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
-        if (remaining.length > 0) {
-          queue.set(remaining.slice(0, 10));
-        }
-      });
+    }).catch(async () => {
+      const recList = await getRecommendations(getLocalUserId());
+      const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+      if (remaining.length > 0) {
+        queue.set(remaining.slice(0, 10));
+      }
     });
   }
 
