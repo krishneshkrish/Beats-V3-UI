@@ -11,152 +11,19 @@ import { resolveStream, recordPlayEvent, invalidateStream, getTrending, getRecom
 import { getLocalUserId } from './user';
 import type { Song } from './types';
 
+// Persistent singleton audio element for iOS Safari background playback continuity
 let audio: HTMLAudioElement | null = null;
+let currentTrackSong: Song | null = null;
 let completionFired = false;
 let preloadFired = false;
+let endedTriggered = false;
 let retryCount = 0;
 let isReplenishing = false;
+let preloadInFlight = false;
+let preloadAudioEl: HTMLAudioElement | null = null;
 
-async function replenishQueueIfNeeded() {
-  if (isReplenishing) return;
-  const q = get(queue);
-  const cur = get(currentSong);
-  if (q.length <= 2 && cur) {
-    isReplenishing = true;
-    try {
-      const existingIds = [cur.id, ...q.map(s => s.id)];
-      const more = await getRadio(cur.id, getLocalUserId(), 12, existingIds);
-      const candidates = more.filter(s => !existingIds.includes(s.id));
-      if (candidates.length > 0) {
-        queue.update(currentQ => [...currentQ, ...candidates]);
-      }
-    } catch (e) {
-      console.warn('Queue replenishment error:', e);
-    } finally {
-      isReplenishing = false;
-    }
-  }
-}
-
-export async function playSong(song: Song, upcomingQueue?: Song[]) {
-  isLoading.set(true);
-  loadingStatus.set('Loading...');
-  completionFired = false;
-  preloadFired = false;
-  retryCount = 0;
-  currentSong.set(song);
-  showPlayer.set(true);
-
-  if (upcomingQueue !== undefined && upcomingQueue.length > 0) {
-    queue.set(upcomingQueue.filter(s => s.id !== song.id));
-    replenishQueueIfNeeded();
-  } else {
-    // Zero-friction Up Next: Seed infinite smart radio, excluding recent history to prevent 2-song loops
-    const excludeList = [song.id, ...get(history).map(s => s.id)];
-    getRadio(song.id, getLocalUserId(), 15, excludeList).then(async radioSongs => {
-      let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
-      if (remaining.length === 0) {
-        // Fallback: If strict exclusion emptied radio, grab trending or recommendations
-        const recList = await getRecommendations(getLocalUserId());
-        remaining = recList.filter(s => s.id !== song.id);
-      }
-      if (remaining.length === 0) {
-        const trendList = await getTrending(song.genre);
-        remaining = trendList.filter(s => s.id !== song.id);
-      }
-      if (remaining.length > 0) {
-        queue.set(remaining);
-      }
-    }).catch(async () => {
-      const recList = await getRecommendations(getLocalUserId());
-      const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
-      if (remaining.length > 0) {
-        queue.set(remaining.slice(0, 10));
-      }
-    });
-  }
-
-  try {
-    const data = await resolveStream(song.id);
-
-    if (!data.stream_url) {
-      throw new Error('No stream URL');
-    }
-
-    const fullStreamUrl = data.stream_url.startsWith('http')
-      ? data.stream_url
-      : `${API_BASE}${data.stream_url.startsWith('/') ? '' : '/'}${data.stream_url}`;
-
-    await initAudio(fullStreamUrl, song);
-  } catch (e) {
-    console.error('Play error:', e);
-    showToast('Could not load song', 'error');
-    isLoading.set(false);
-    isPlaying.set(false);
-  }
-}
-
-async function initAudio(streamUrl: string, song: Song) {
-  // cleanup previous audio
-  if (audio) {
-    audio.pause();
-    audio.removeAttribute('src');
-    audio.load();
-    audio = null;
-  }
-
-  if (typeof Audio === 'undefined') return;
-
-  audio = new Audio();
-  audio.preload = 'auto';
-  audio.volume = get(volume);
-
-  // iOS requirement
-  (audio as any).playsInline = true;
-
-  audio.src = streamUrl;
-
-  audio.addEventListener('canplay', () => {
-    isLoading.set(false);
-    loadingStatus.set('');
-  });
-
-  audio.addEventListener('timeupdate', () => {
-    if (!audio || !audio.duration) return;
-    const pct = audio.currentTime / audio.duration;
-
-    progress.set(isNaN(pct) ? 0 : pct);
-    currentTime.set(audio.currentTime);
-
-    // preload next at 70%
-    if (pct > 0.7 && !preloadFired) {
-      preloadFired = true;
-      preloadNext();
-    }
-
-    // mark completed at 90%
-    if (pct > 0.9 && !completionFired) {
-      completionFired = true;
-      recordPlayEvent(
-        getLocalUserId(),
-        song.id,
-        song.genre,
-        true,
-        null,
-        'browse'
-      );
-    }
-  });
-
-  audio.addEventListener('loadedmetadata', () => {
-    if (audio && !isNaN(audio.duration)) {
-      duration.set(audio.duration);
-    }
-  });
-
-  audio.addEventListener('ended', () => {
-    playNext();
-  });
+// In-memory stream URL cache so background/lockscreen transitions happen with 0 network latency
+const streamUrlCache = new Map<string, string>();
 
 let cachedSynthesizedTrack: string | null = null;
 
@@ -205,16 +72,114 @@ function getSynthesizedTrackUrl(): string {
   return cachedSynthesizedTrack;
 }
 
-  audio.addEventListener('error', async () => {
-    invalidateStream(song.id);
+function getOrCreateAudio(): HTMLAudioElement | null {
+  if (typeof Audio === 'undefined') return null;
+  if (!audio) {
+    audio = new Audio();
+    audio.preload = 'auto';
+    // Critical iOS Safari attributes for inline and background playback
+    (audio as any).playsInline = true;
+    audio.setAttribute('playsinline', 'true');
+    audio.setAttribute('webkit-playsinline', 'true');
+    audio.volume = get(volume);
+    attachAudioListeners(audio);
+  }
+  return audio;
+}
+
+function attachAudioListeners(el: HTMLAudioElement) {
+  el.addEventListener('canplay', () => {
+    isLoading.set(false);
+    loadingStatus.set('');
+  });
+
+  el.addEventListener('playing', () => {
+    isPlaying.set(true);
+    isLoading.set(false);
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'playing';
+    }
+  });
+
+  el.addEventListener('pause', () => {
+    isPlaying.set(false);
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'paused';
+    }
+  });
+
+  el.addEventListener('timeupdate', () => {
+    if (!el || !el.duration || isNaN(el.duration)) return;
+    const pct = el.currentTime / el.duration;
+
+    progress.set(isNaN(pct) ? 0 : pct);
+    currentTime.set(el.currentTime);
+
+    // Sync lockscreen position state on iOS
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: el.duration,
+          playbackRate: el.playbackRate || 1,
+          position: el.currentTime
+        });
+      } catch {}
+    }
+
+    // Preload next track as soon as 40% is reached
+    if (pct > 0.4 && !preloadFired) {
+      preloadFired = true;
+      preloadNext();
+    }
+
+    // Mark completed event in analytics at 85%
+    if (pct > 0.85 && !completionFired && currentTrackSong) {
+      completionFired = true;
+      recordPlayEvent(
+        getLocalUserId(),
+        currentTrackSong.id,
+        currentTrackSong.genre,
+        true,
+        null,
+        'browse'
+      );
+    }
+
+    // iOS Lockscreen Safety: transition seamlessly 0.3s before end so iOS audio session does not sleep
+    if (el.duration > 2 && (el.duration - el.currentTime <= 0.3) && !endedTriggered) {
+      endedTriggered = true;
+      playNext();
+    }
+  });
+
+  el.addEventListener('loadedmetadata', () => {
+    if (el && !isNaN(el.duration)) {
+      duration.set(el.duration);
+    }
+  });
+
+  el.addEventListener('ended', () => {
+    if (!endedTriggered) {
+      endedTriggered = true;
+      playNext();
+    }
+  });
+
+  el.addEventListener('error', async () => {
+    if (!currentTrackSong) {
+      isLoading.set(false);
+      isPlaying.set(false);
+      return;
+    }
+    invalidateStream(currentTrackSong.id);
     if (retryCount < 1) {
       retryCount++;
       const synthUrl = getSynthesizedTrackUrl();
-      if (synthUrl && audio && audio.src !== synthUrl) {
-        audio.src = synthUrl;
-        audio.loop = true;
-        duration.set(song.duration || 180);
-        audio.play().then(() => {
+      if (synthUrl && el && el.src !== synthUrl) {
+        el.src = synthUrl;
+        el.loop = true;
+        duration.set(currentTrackSong.duration || 180);
+        el.play().then(() => {
           isLoading.set(false);
           isPlaying.set(true);
         }).catch(() => {
@@ -227,27 +192,80 @@ function getSynthesizedTrackUrl(): string {
     isLoading.set(false);
     isPlaying.set(false);
   });
+}
 
-  try {
-    await audio.play();
-    isPlaying.set(true);
-  } catch (err) {
-    console.warn('Playback gesture required or auto-blocked:', err);
-    // Still set loaded state so user can press play button
-    isLoading.set(false);
-    isPlaying.set(false);
+async function replenishQueueIfNeeded() {
+  if (isReplenishing) return;
+  const q = get(queue);
+  const cur = get(currentSong);
+  if (q.length <= 2 && cur) {
+    isReplenishing = true;
+    try {
+      const existingIds = [cur.id, ...q.map(s => s.id)];
+      const more = await getRadio(cur.id, getLocalUserId(), 12, existingIds);
+      const candidates = more.filter(s => !existingIds.includes(s.id));
+      if (candidates.length > 0) {
+        queue.update(currentQ => [...currentQ, ...candidates]);
+        // Preload newly added track in background
+        preloadNext();
+      }
+    } catch (e) {
+      console.warn('Queue replenishment error:', e);
+    } finally {
+      isReplenishing = false;
+    }
+  }
+}
+
+async function getOrFetchStreamUrl(songId: string): Promise<string> {
+  const cached = streamUrlCache.get(songId);
+  if (cached) return cached;
+
+  const data = await resolveStream(songId);
+  if (!data.stream_url) {
+    throw new Error('No stream URL');
   }
 
-  // Media Session API (lock screen controls)
-  setupMediaSession(song);
+  const fullStreamUrl = data.stream_url.startsWith('http')
+    ? data.stream_url
+    : `${API_BASE}${data.stream_url.startsWith('/') ? '' : '/'}${data.stream_url}`;
 
-  // add to history
+  streamUrlCache.set(songId, fullStreamUrl);
+  return fullStreamUrl;
+}
+
+export async function preloadNext() {
+  if (preloadInFlight) return;
+  const q = get(queue);
+  if (q.length === 0) return;
+  const nextSong = q[0];
+  if (streamUrlCache.has(nextSong.id)) return;
+
+  preloadInFlight = true;
+  try {
+    const url = await getOrFetchStreamUrl(nextSong.id);
+    // Warm up HTTP connection & pre-buffer metadata on iOS
+    if (typeof Audio !== 'undefined' && url) {
+      if (!preloadAudioEl) {
+        preloadAudioEl = new Audio();
+        preloadAudioEl.preload = 'metadata';
+        (preloadAudioEl as any).playsInline = true;
+      }
+      preloadAudioEl.src = url;
+    }
+  } catch (e) {
+    console.debug('Preload notice:', e);
+  } finally {
+    preloadInFlight = false;
+  }
+}
+
+function recordHistoryAndPlayEvent(song: Song) {
   history.update(h => {
     const filtered = h.filter(x => x.id !== song.id);
     return [song, ...filtered.slice(0, 49)];
   });
 
-  // record play event
   recordPlayEvent(
     getLocalUserId(),
     song.id,
@@ -285,8 +303,12 @@ function setupMediaSession(song: Song) {
       audio?.pause();
       isPlaying.set(false);
     });
-    navigator.mediaSession.setActionHandler('nexttrack', playNext);
-    navigator.mediaSession.setActionHandler('previoustrack', playPrev);
+    navigator.mediaSession.setActionHandler('nexttrack', () => {
+      playNext();
+    });
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      playPrev();
+    });
     navigator.mediaSession.setActionHandler('seekto', d => {
       if (audio && d.seekTime !== undefined) {
         audio.currentTime = d.seekTime;
@@ -297,27 +319,134 @@ function setupMediaSession(song: Song) {
   }
 }
 
-export function togglePlay() {
-  if (!audio) {
-    const cur = get(currentSong);
-    if (cur) playSong(cur);
-    return;
+/**
+ * Synchronous transition to a new track on the SAME audio element.
+ * Crucial for iOS background & lock screen: avoids async network delays that cause WebKit to suspend execution.
+ */
+function transitionToTrack(streamUrl: string, song: Song) {
+  const el = getOrCreateAudio();
+  if (!el) return;
+
+  completionFired = false;
+  preloadFired = false;
+  endedTriggered = false;
+  retryCount = 0;
+  currentTrackSong = song;
+
+  currentSong.set(song);
+  showPlayer.set(true);
+  isLoading.set(true);
+  loadingStatus.set('');
+
+  // Re-use same audio element and trigger play synchronously
+  el.src = streamUrl;
+  el.currentTime = 0;
+  el.volume = get(volume);
+
+  const playPromise = el.play();
+  if (playPromise !== undefined) {
+    playPromise.then(() => {
+      isPlaying.set(true);
+      isLoading.set(false);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'playing';
+      }
+    }).catch(err => {
+      console.warn('Playback gesture required or auto-blocked:', err);
+      isLoading.set(false);
+      isPlaying.set(false);
+    });
   }
-  if (audio.paused) {
-    audio.play().catch(e => console.warn('Play interrupted:', e));
-    isPlaying.set(true);
+
+  setupMediaSession(song);
+  recordHistoryAndPlayEvent(song);
+
+  // Preload upcoming track in queue immediately while current song starts
+  setTimeout(() => {
+    preloadNext();
+  }, 1200);
+}
+
+export async function playSong(song: Song, upcomingQueue?: Song[]) {
+  isLoading.set(true);
+  loadingStatus.set('Loading...');
+  completionFired = false;
+  preloadFired = false;
+  endedTriggered = false;
+  retryCount = 0;
+  currentSong.set(song);
+  showPlayer.set(true);
+
+  if (upcomingQueue !== undefined && upcomingQueue.length > 0) {
+    queue.set(upcomingQueue.filter(s => s.id !== song.id));
+    replenishQueueIfNeeded();
   } else {
-    audio.pause();
+    // Zero-friction Up Next: Seed infinite smart radio
+    const excludeList = [song.id, ...get(history).map(s => s.id)];
+    getRadio(song.id, getLocalUserId(), 15, excludeList).then(async radioSongs => {
+      let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+      if (remaining.length === 0) {
+        const recList = await getRecommendations(getLocalUserId());
+        remaining = recList.filter(s => s.id !== song.id);
+      }
+      if (remaining.length === 0) {
+        const trendList = await getTrending(song.genre);
+        remaining = trendList.filter(s => s.id !== song.id);
+      }
+      if (remaining.length > 0) {
+        queue.set(remaining);
+        preloadNext();
+      }
+    }).catch(async () => {
+      const recList = await getRecommendations(getLocalUserId());
+      const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+      if (remaining.length > 0) {
+        queue.set(remaining.slice(0, 10));
+        preloadNext();
+      }
+    });
+  }
+
+  try {
+    const fullStreamUrl = await getOrFetchStreamUrl(song.id);
+    transitionToTrack(fullStreamUrl, song);
+  } catch (e) {
+    console.error('Play error:', e);
+    showToast('Could not load song', 'error');
+    isLoading.set(false);
     isPlaying.set(false);
   }
 }
 
+export function togglePlay() {
+  const el = getOrCreateAudio();
+  if (!el) {
+    const cur = get(currentSong);
+    if (cur) playSong(cur);
+    return;
+  }
+  if (el.paused) {
+    el.play().catch(e => console.warn('Play interrupted:', e));
+    isPlaying.set(true);
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'playing';
+    }
+  } else {
+    el.pause();
+    isPlaying.set(false);
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = 'paused';
+    }
+  }
+}
+
 export function seek(ratio: number) {
-  if (audio && audio.duration) {
+  const el = getOrCreateAudio();
+  if (el && el.duration) {
     const clamped = Math.max(0, Math.min(1, ratio));
-    audio.currentTime = clamped * audio.duration;
+    el.currentTime = clamped * el.duration;
     progress.set(clamped);
-    currentTime.set(audio.currentTime);
+    currentTime.set(el.currentTime);
   }
 }
 
@@ -356,34 +485,44 @@ export async function playNext() {
     } catch {}
     return;
   }
+
   const [next, ...rest] = q;
+
+  // FAST PATH for iOS Lock Screen / Background:
+  // If next track is already cached in memory, transition IMMEDIATELY (0ms async delay)
+  // so iOS background WebKit never sleeps!
+  const cachedUrl = streamUrlCache.get(next.id);
+  if (cachedUrl) {
+    queue.set(rest);
+    transitionToTrack(cachedUrl, next);
+    replenishQueueIfNeeded();
+    return;
+  }
+
+  // Otherwise, fetch and play
   await playSong(next, rest);
   replenishQueueIfNeeded();
 }
 
 export async function playPrev() {
-  if (audio && audio.currentTime > 3) {
-    audio.currentTime = 0;
+  const el = getOrCreateAudio();
+  if (el && el.currentTime > 3) {
+    el.currentTime = 0;
     return;
   }
   const h = get(history);
   if (h.length > 1) {
     await playSong(h[1]);
-  } else if (audio) {
-    audio.currentTime = 0;
+  } else if (el) {
+    el.currentTime = 0;
   }
 }
 
 export function addToQueue(song: Song) {
   queue.update(q => [...q, song]);
   showToast(`Added to queue: ${song.title}`, 'success');
-}
-
-function preloadNext() {
-  const q = get(queue);
-  if (q.length === 0) return;
-  // warm Redis cache for next song
-  resolveStream(q[0].id).catch(() => {});
+  // Proactively cache URL for added song
+  preloadNext();
 }
 
 export function formatTime(seconds: number): string {
