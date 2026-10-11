@@ -1,0 +1,53 @@
+:root {
+  --black: #0a0a0a;
+  --black-2: #111111;
+  --black-3: #1a1a1a;
+  --white: #ffffff;
+  --white-dim: #888888;
+  --red: #e8192c;
+  --red-dark: #b01020;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+html {
+  font-size: 16px;
+  background: #0a0a0a;
+}
+
+body {
+  font-family: 'Space Grotesk', sans-serif;
+  background: #0a0a0a;
+  color: #ffffff;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+/* hide scrollbars globally */
+::-webkit-scrollbar { display: none; }
+* { scrollbar-width: none; }
+
+/* smooth scroll */
+html { scroll-behavior: smooth; }
+
+/* remove input defaults */
+input, button {
+  font-family: 'Space Grotesk', sans-serif;
+  border: none;
+  outline: none;
+  cursor: pointer;
+}
+
+input { cursor: text; }
+
+/* safe area for iPhone */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
