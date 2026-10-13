@@ -320,10 +320,20 @@ export async function getRadio(
     console.warn('Radio endpoint error, falling back:', err);
   }
 
-  const found = SAMPLE_SONGS.find(s => s.id === songId);
-  const targetGenre = found ? found.genre.toLowerCase() : '';
-  const filtered = SAMPLE_SONGS.filter(s => s.id !== songId && (!targetGenre || s.genre.toLowerCase() === targetGenre));
-  return filtered.length > 0 ? filtered : SAMPLE_SONGS.filter(s => s.id !== songId);
+  // Resilient fallback: Query live recommendations or trending songs, never static dummy songs
+  try {
+    const recs = await getRecommendations(userId);
+    const valid = recs.filter(s => s.id !== songId && !excludeIds.includes(s.id));
+    if (valid.length > 0) return valid;
+  } catch {}
+
+  try {
+    const trend = await getTrending();
+    const valid = trend.filter(s => s.id !== songId && !excludeIds.includes(s.id));
+    if (valid.length > 0) return valid;
+  } catch {}
+
+  return [];
 }
 
 export async function recordPlayEvent(
