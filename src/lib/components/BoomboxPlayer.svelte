@@ -267,7 +267,7 @@
 
         {#if $queue.length > 0}
           <div class="queue-list">
-            {#each $queue.slice(0, 3) as item, i (item.id)}
+            {#each $queue.slice(0, 10) as item, i (item.id)}
               <div
                 class="tape-card"
                 on:click={() => jumpToQueueSong(item, i)}
@@ -763,6 +763,9 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+    padding-right: 4px;
   }
 
   .tape-genre {

@@ -198,10 +198,10 @@ async function replenishQueueIfNeeded() {
   if (isReplenishing) return;
   const q = get(queue);
   const cur = get(currentSong);
-  if (q.length <= 2 && cur) {
+  if (q.length <= 4 && cur) {
     isReplenishing = true;
     try {
-      const existingIds = [cur.id, ...q.map(s => s.id)];
+      const existingIds = [cur.id, ...q.map(s => s.id), ...get(history).map(s => s.id)];
       const more = await getRadio(cur.id, getLocalUserId(), 12, existingIds);
       const candidates = more.filter(s => !existingIds.includes(s.id));
       if (candidates.length > 0) {
@@ -340,6 +340,7 @@ function transitionToTrack(streamUrl: string, song: Song) {
 
   // Re-use same audio element and trigger play synchronously
   el.src = streamUrl;
+  el.loop = false;
   el.currentTime = 0;
   el.volume = get(volume);
 
@@ -387,11 +388,11 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
       let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length === 0) {
         const recList = await getRecommendations(getLocalUserId());
-        remaining = recList.filter(s => s.id !== song.id);
+        remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       }
       if (remaining.length === 0) {
         const trendList = await getTrending(song.genre);
-        remaining = trendList.filter(s => s.id !== song.id);
+        remaining = trendList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       }
       if (remaining.length > 0) {
         queue.set(remaining);
@@ -462,8 +463,9 @@ export async function playNext() {
     const cur = get(currentSong);
     if (!cur) return;
     try {
-      const more = await getRadio(cur.id, getLocalUserId(), 15, [cur.id]);
-      const candidates = more.filter(s => s.id !== cur.id);
+      const historyIds = [cur.id, ...get(history).map(s => s.id)];
+      const more = await getRadio(cur.id, getLocalUserId(), 15, historyIds);
+      const candidates = more.filter(s => !historyIds.includes(s.id));
       if (candidates.length > 0) {
         const [next, ...rest] = candidates;
         queue.set(rest);
@@ -474,7 +476,7 @@ export async function playNext() {
     } catch {}
     try {
       const more = await getRecommendations(getLocalUserId());
-      const candidates = more.filter(s => s.id !== cur.id);
+      const candidates = more.filter(s => !historyIds.includes(s.id));
       if (candidates.length > 0) {
         const [next, ...rest] = candidates;
         queue.set(rest);
