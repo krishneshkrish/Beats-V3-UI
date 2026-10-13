@@ -9,6 +9,8 @@ export interface Song {
   thumbnail_url?: string;
   play_count: number;
   status: 'available' | 'unavailable';
+  source_url?: string;
+  stream_url?: string;
 }
 
 export interface PlayerState {

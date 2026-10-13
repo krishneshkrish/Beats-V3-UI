@@ -30,9 +30,9 @@
     loading = false;
   }
 
-  onMount(async () => {
+  onMount(() => {
     userName = getUserName();
-    await loadStats();
+    loadStats();
     if (typeof window !== 'undefined') {
       const onFocus = () => loadStats(false);
       window.addEventListener('focus', onFocus);

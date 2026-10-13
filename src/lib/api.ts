@@ -1,3 +1,4 @@
+import { cacheStreamUrl } from './streamCache';
 import { API_BASE } from './config';
 import type { Song, UserStats } from './types';
 
@@ -163,18 +164,27 @@ function normalizeSongList(data: any): Song[] {
     rawList = data.data;
   }
 
-  return rawList.map((item, idx) => ({
-    id: String(item.id || item.song_id || `track-${idx}`),
-    title: String(item.title || item.name || 'Unknown Track'),
-    artist: String(item.artist || item.singers || 'Unknown Artist'),
-    film: item.film || item.album || undefined,
-    genre: String(item.genre || 'mix').toLowerCase(),
-    language: item.language || undefined,
-    duration: Number(item.duration) || 180,
-    thumbnail_url: item.thumbnail_url || item.thumbnail || item.image || undefined,
-    play_count: Number(item.play_count) || 0,
-    status: item.status || 'available'
-  }));
+  return rawList.map((item, idx) => {
+    const id = String(item.id || item.song_id || `track-${idx}`);
+    const directUrl = item.source_url || item.stream_url;
+    if (directUrl && (directUrl.includes("saavncdn.com") || directUrl.includes(".mp3") || directUrl.includes(".mp4") || directUrl.includes(".m4a") || directUrl.includes("masstamilan.download"))) {
+      cacheStreamUrl(id, directUrl);
+    }
+    return {
+      id,
+      title: String(item.title || item.name || "Unknown Track"),
+      artist: String(item.artist || item.singers || "Unknown Artist"),
+      film: item.film || item.album || undefined,
+      genre: String(item.genre || "mix").toLowerCase(),
+      language: item.language || undefined,
+      duration: Number(item.duration) || 180,
+      thumbnail_url: item.thumbnail_url || item.thumbnail || item.image || undefined,
+      play_count: Number(item.play_count) || 0,
+      status: item.status || "available",
+      source_url: directUrl || undefined,
+      stream_url: directUrl || undefined
+    };
+  });
 }
 
 export async function searchSongs(query: string, limit = 20): Promise<Song[]> {
@@ -231,6 +241,7 @@ export async function resolveStream(
         if (!data.stream_url.startsWith('http')) {
           data.stream_url = `${API_BASE}${data.stream_url.startsWith('/') ? '' : '/'}${data.stream_url}`;
         }
+        cacheStreamUrl(songId, data.stream_url);
         return data;
       }
     } else {

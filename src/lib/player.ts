@@ -8,22 +8,22 @@ import {
 } from './stores/player';
 import { showToast } from './stores/toast';
 import { resolveStream, recordPlayEvent, invalidateStream, getTrending, getRecommendations, getRadio } from './api';
+import { streamUrlCache, cacheStreamUrl, getCachedStreamUrl } from './streamCache';
 import { getLocalUserId } from './user';
 import type { Song } from './types';
 
-// Persistent singleton audio element for iOS Safari background playback continuity
+export { cacheStreamUrl, getCachedStreamUrl };
+
+// Persistent singleton audio element for iOS Safari / Mobile background playback continuity
 let audio: HTMLAudioElement | null = null;
 let currentTrackSong: Song | null = null;
 let completionFired = false;
 let preloadFired = false;
 let endedTriggered = false;
+let lastTransitionTime = 0;
 let retryCount = 0;
 let isReplenishing = false;
 let preloadInFlight = false;
-let preloadAudioEl: HTMLAudioElement | null = null;
-
-// In-memory stream URL cache so background/lockscreen transitions happen with 0 network latency
-const streamUrlCache = new Map<string, string>();
 
 let cachedSynthesizedTrack: string | null = null;
 
@@ -83,8 +83,34 @@ function getOrCreateAudio(): HTMLAudioElement | null {
     audio.setAttribute('webkit-playsinline', 'true');
     audio.volume = get(volume);
     attachAudioListeners(audio);
+    initMediaSessionHandlers();
   }
   return audio;
+}
+
+function initMediaSessionHandlers() {
+  if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+  try {
+    navigator.mediaSession.setActionHandler('play', () => {
+      togglePlay();
+    });
+    navigator.mediaSession.setActionHandler('pause', () => {
+      togglePlay();
+    });
+    navigator.mediaSession.setActionHandler('nexttrack', () => {
+      playNext();
+    });
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      playPrev();
+    });
+    navigator.mediaSession.setActionHandler('seekto', d => {
+      if (audio && d.seekTime !== undefined) {
+        audio.currentTime = d.seekTime;
+      }
+    });
+  } catch (e) {
+    console.debug('MediaSession action handler error:', e);
+  }
 }
 
 function attachAudioListeners(el: HTMLAudioElement) {
@@ -99,6 +125,8 @@ function attachAudioListeners(el: HTMLAudioElement) {
     if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
       navigator.mediaSession.playbackState = 'playing';
     }
+    // Proactively pre-resolve queue tracks while active audio keeps background JS alive
+    preloadQueue(3);
   });
 
   el.addEventListener('pause', () => {
@@ -126,10 +154,10 @@ function attachAudioListeners(el: HTMLAudioElement) {
       } catch {}
     }
 
-    // Preload next track as soon as 40% is reached
-    if (pct > 0.4 && !preloadFired) {
+    // Proactive background queue resolve at 30%
+    if (pct > 0.3 && !preloadFired) {
       preloadFired = true;
-      preloadNext();
+      preloadQueue(3);
     }
 
     // Mark completed event in analytics at 85%
@@ -145,8 +173,9 @@ function attachAudioListeners(el: HTMLAudioElement) {
       );
     }
 
-    // iOS Lockscreen Safety: transition seamlessly 0.3s before end so iOS audio session does not sleep
-    if (el.duration > 2 && (el.duration - el.currentTime <= 0.3) && !endedTriggered) {
+    // iOS Lockscreen Safety: transition seamlessly 0.35s before end so iOS audio session does not sleep
+    // Debounced with lastTransitionTime to prevent accidental double-skips
+    if (el.duration > 2 && (el.duration - el.currentTime <= 0.35) && !endedTriggered && (Date.now() - lastTransitionTime > 2500)) {
       endedTriggered = true;
       playNext();
     }
@@ -159,7 +188,7 @@ function attachAudioListeners(el: HTMLAudioElement) {
   });
 
   el.addEventListener('ended', () => {
-    if (!endedTriggered) {
+    if (!endedTriggered && (Date.now() - lastTransitionTime > 2500)) {
       endedTriggered = true;
       playNext();
     }
@@ -206,8 +235,7 @@ async function replenishQueueIfNeeded() {
       const candidates = more.filter(s => !existingIds.includes(s.id));
       if (candidates.length > 0) {
         queue.update(currentQ => [...currentQ, ...candidates]);
-        // Preload newly added track in background
-        preloadNext();
+        preloadQueue(3);
       }
     } catch (e) {
       console.warn('Queue replenishment error:', e);
@@ -218,7 +246,7 @@ async function replenishQueueIfNeeded() {
 }
 
 async function getOrFetchStreamUrl(songId: string): Promise<string> {
-  const cached = streamUrlCache.get(songId);
+  const cached = getCachedStreamUrl(songId);
   if (cached) return cached;
 
   const data = await resolveStream(songId);
@@ -230,34 +258,47 @@ async function getOrFetchStreamUrl(songId: string): Promise<string> {
     ? data.stream_url
     : `${API_BASE}${data.stream_url.startsWith('/') ? '' : '/'}${data.stream_url}`;
 
-  streamUrlCache.set(songId, fullStreamUrl);
+  cacheStreamUrl(songId, fullStreamUrl);
   return fullStreamUrl;
 }
 
-export async function preloadNext() {
+/**
+ * Preloads and resolves the next few tracks in the queue without interrupting audio or WebKit context.
+ * CRITICAL: Never creates secondary HTMLAudioElement instances on mobile Safari (causes lockscreen freeze).
+ */
+export async function preloadQueue(depth = 3) {
   if (preloadInFlight) return;
   const q = get(queue);
-  if (q.length === 0) return;
-  const nextSong = q[0];
-  if (streamUrlCache.has(nextSong.id)) return;
+  if (!q || q.length === 0) return;
 
   preloadInFlight = true;
   try {
-    const url = await getOrFetchStreamUrl(nextSong.id);
-    // Warm up HTTP connection & pre-buffer metadata on iOS
-    if (typeof Audio !== 'undefined' && url) {
-      if (!preloadAudioEl) {
-        preloadAudioEl = new Audio();
-        preloadAudioEl.preload = 'metadata';
-        (preloadAudioEl as any).playsInline = true;
+    const targets = q.slice(0, depth);
+    for (const song of targets) {
+      if (!song || !song.id) continue;
+      if (getCachedStreamUrl(song.id)) continue;
+
+      if (song.source_url || song.stream_url) {
+        const u = song.source_url || song.stream_url;
+        if (u && (u.includes('saavncdn.com') || u.includes('.mp3') || u.includes('.mp4') || u.includes('.m4a') || u.includes('masstamilan.download'))) {
+          cacheStreamUrl(song.id, u);
+          continue;
+        }
       }
-      preloadAudioEl.src = url;
+
+      try {
+        await getOrFetchStreamUrl(song.id);
+      } catch (err) {
+        console.debug('Pre-resolve error for track:', song.title, err);
+      }
     }
-  } catch (e) {
-    console.debug('Preload notice:', e);
   } finally {
     preloadInFlight = false;
   }
+}
+
+export async function preloadNext() {
+  return preloadQueue(3);
 }
 
 function recordHistoryAndPlayEvent(song: Song) {
@@ -283,7 +324,7 @@ function setupMediaSession(song: Song) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: song.title,
       artist: song.artist,
-      album: song.film || song.genre.toUpperCase() || 'Beats',
+      album: song.film || (song.genre ? song.genre.toUpperCase() : 'Beats'),
       artwork: song.thumbnail_url
         ? [
             {
@@ -293,26 +334,6 @@ function setupMediaSession(song: Song) {
             }
           ]
         : []
-    });
-
-    navigator.mediaSession.setActionHandler('play', () => {
-      audio?.play().catch(() => {});
-      isPlaying.set(true);
-    });
-    navigator.mediaSession.setActionHandler('pause', () => {
-      audio?.pause();
-      isPlaying.set(false);
-    });
-    navigator.mediaSession.setActionHandler('nexttrack', () => {
-      playNext();
-    });
-    navigator.mediaSession.setActionHandler('previoustrack', () => {
-      playPrev();
-    });
-    navigator.mediaSession.setActionHandler('seekto', d => {
-      if (audio && d.seekTime !== undefined) {
-        audio.currentTime = d.seekTime;
-      }
     });
   } catch (e) {
     console.debug('MediaSession registration error:', e);
@@ -330,6 +351,7 @@ function transitionToTrack(streamUrl: string, song: Song) {
   completionFired = false;
   preloadFired = false;
   endedTriggered = false;
+  lastTransitionTime = Date.now();
   retryCount = 0;
   currentTrackSong = song;
 
@@ -362,10 +384,8 @@ function transitionToTrack(streamUrl: string, song: Song) {
   setupMediaSession(song);
   recordHistoryAndPlayEvent(song);
 
-  // Preload upcoming track in queue immediately while current song starts
-  setTimeout(() => {
-    preloadNext();
-  }, 1200);
+  // Proactively resolve upcoming queue items immediately while audio session is hot
+  preloadQueue(3);
 }
 
 export async function playSong(song: Song, upcomingQueue?: Song[]) {
@@ -374,12 +394,18 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   completionFired = false;
   preloadFired = false;
   endedTriggered = false;
+  lastTransitionTime = Date.now();
   retryCount = 0;
   currentSong.set(song);
   showPlayer.set(true);
 
+  if (song.source_url || song.stream_url) {
+    cacheStreamUrl(song.id, song.source_url || song.stream_url);
+  }
+
   if (upcomingQueue !== undefined && upcomingQueue.length > 0) {
     queue.set(upcomingQueue.filter(s => s.id !== song.id));
+    preloadQueue(3);
     replenishQueueIfNeeded();
   } else {
     // Zero-friction Up Next: Seed infinite smart radio
@@ -396,14 +422,14 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
       }
       if (remaining.length > 0) {
         queue.set(remaining);
-        preloadNext();
+        preloadQueue(3);
       }
     }).catch(async () => {
       const recList = await getRecommendations(getLocalUserId());
       const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length > 0) {
         queue.set(remaining.slice(0, 10));
-        preloadNext();
+        preloadQueue(3);
       }
     });
   }
@@ -462,8 +488,8 @@ export async function playNext() {
   if (q.length === 0) {
     const cur = get(currentSong);
     if (!cur) return;
+    const historyIds = [cur.id, ...get(history).map(s => s.id)];
     try {
-      const historyIds = [cur.id, ...get(history).map(s => s.id)];
       const more = await getRadio(cur.id, getLocalUserId(), 15, historyIds);
       const candidates = more.filter(s => !historyIds.includes(s.id));
       if (candidates.length > 0) {
@@ -491,19 +517,30 @@ export async function playNext() {
   const [next, ...rest] = q;
 
   // FAST PATH for iOS Lock Screen / Background:
-  // If next track is already cached in memory, transition IMMEDIATELY (0ms async delay)
+  // If next track is already cached in memory or has direct source_url, transition IMMEDIATELY (0ms delay)
   // so iOS background WebKit never sleeps!
-  const cachedUrl = streamUrlCache.get(next.id);
-  if (cachedUrl) {
+  const directUrl = getCachedStreamUrl(next.id) || next.stream_url || next.source_url;
+  if (directUrl) {
+    cacheStreamUrl(next.id, directUrl);
     queue.set(rest);
-    transitionToTrack(cachedUrl, next);
+    transitionToTrack(directUrl, next);
     replenishQueueIfNeeded();
     return;
   }
 
-  // Otherwise, fetch and play
-  await playSong(next, rest);
-  replenishQueueIfNeeded();
+  // Fallback if cache missed
+  try {
+    const fullStreamUrl = await getOrFetchStreamUrl(next.id);
+    queue.set(rest);
+    transitionToTrack(fullStreamUrl, next);
+    replenishQueueIfNeeded();
+  } catch (err) {
+    console.error('playNext fallback error for:', next.title, err);
+    if (rest.length > 0) {
+      queue.set(rest);
+      playNext();
+    }
+  }
 }
 
 export async function playPrev() {
@@ -524,7 +561,10 @@ export function addToQueue(song: Song) {
   queue.update(q => [...q, song]);
   showToast(`Added to queue: ${song.title}`, 'success');
   // Proactively cache URL for added song
-  preloadNext();
+  if (song.source_url || song.stream_url) {
+    cacheStreamUrl(song.id, song.source_url || song.stream_url);
+  }
+  preloadQueue(3);
 }
 
 export function formatTime(seconds: number): string {
