@@ -14,16 +14,30 @@
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const HOURS = Array.from({ length: 24 }, (_, i) => i);
 
+  let refreshing = false;
+
+  async function loadStats(showSpinner = false) {
+    if (showSpinner) refreshing = true;
+    const userId = getLocalUserId();
+    const data = await getUserStats(userId);
+    if (data) {
+      statsData = data;
+      if ((data as any).taste_profile) {
+        tasteProfile = (data as any).taste_profile;
+      }
+    }
+    refreshing = false;
+    loading = false;
+  }
+
   onMount(async () => {
     userName = getUserName();
-    const userId = getLocalUserId();
-    if (!statsData) {
-      statsData = await getUserStats(userId);
+    await loadStats();
+    if (typeof window !== 'undefined') {
+      const onFocus = () => loadStats(false);
+      window.addEventListener('focus', onFocus);
+      return () => window.removeEventListener('focus', onFocus);
     }
-    if (statsData && (statsData as any).taste_profile) {
-      tasteProfile = (statsData as any).taste_profile;
-    }
-    loading = false;
   });
 
   function getCellColor(count: number): string {
@@ -39,7 +53,12 @@
   <div class="stats-header">
     <div class="title-row">
       <h1 class="page-title">YOUR STATS</h1>
-      <span class="range-badge">LAST 30 DAYS</span>
+      <div class="header-badges">
+        <span class="range-badge">LAST 30 DAYS</span>
+        <button type="button" class="refresh-badge-btn" on:click={() => loadStats(true)} disabled={refreshing}>
+          {refreshing ? 'UPDATING...' : '⟳ REFRESH'}
+        </button>
+      </div>
     </div>
     {#if userName}
       <div class="user-subtext">LISTENER: {userName.toUpperCase()}</div>
@@ -193,6 +212,12 @@
     margin: 0;
   }
 
+  .header-badges {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .range-badge {
     color: #555555;
     font-size: 11px;
@@ -201,6 +226,29 @@
     border: 1px solid #333333;
     padding: 4px 8px;
     border-radius: 4px;
+  }
+
+  .refresh-badge-btn {
+    background: transparent;
+    color: #e8192c;
+    border: 1px solid #e8192c;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .refresh-badge-btn:hover:not(:disabled) {
+    background: #e8192c;
+    color: #ffffff;
+  }
+
+  .refresh-badge-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .user-subtext {
