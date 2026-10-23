@@ -14,11 +14,20 @@ import type { Song } from './types';
 
 export { cacheStreamUrl, getCachedStreamUrl };
 
-// Persistent singleton audio element for iOS Safari / Mobile background playback continuity
-let audio: HTMLAudioElement | null = null;
+// Dual HTMLAudioElement ping-pong architecture for seamless, gapless iOS background playback
+let audioA: HTMLAudioElement | null = null;
+let audioB: HTMLAudioElement | null = null;
+let activeAudio: HTMLAudioElement | null = null;
+let preloaderAudio: HTMLAudioElement | null = null;
+let preloadedSongId: string | null = null;
+
+// Keep-alive AudioContext to prevent iOS WebKit from suspending background execution
+let audioCtx: AudioContext | null = null;
+
 let currentTrackSong: Song | null = null;
 let completionFired = false;
 let preloadFired = false;
+let advancePreloadFired = false;
 let endedTriggered = false;
 let lastTransitionTime = 0;
 let retryCount = 0;
@@ -26,6 +35,29 @@ let isReplenishing = false;
 let preloadInFlight = false;
 
 let cachedSynthesizedTrack: string | null = null;
+
+function ensureAudioKeepAlive() {
+  if (typeof window === 'undefined') return;
+  if (!audioCtx) {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioContextClass) {
+        audioCtx = new AudioContextClass();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0.0001; // Inaudible, keeps iOS audio daemon active
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+      }
+    } catch (e) {
+      console.debug('Keep-alive context notice:', e);
+    }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+}
 
 function getSynthesizedTrackUrl(): string {
   if (cachedSynthesizedTrack) return cachedSynthesizedTrack;
@@ -74,18 +106,27 @@ function getSynthesizedTrackUrl(): string {
 
 function getOrCreateAudio(): HTMLAudioElement | null {
   if (typeof Audio === 'undefined') return null;
-  if (!audio) {
-    audio = new Audio();
-    audio.preload = 'auto';
-    // Critical iOS Safari attributes for inline and background playback
-    (audio as any).playsInline = true;
-    audio.setAttribute('playsinline', 'true');
-    audio.setAttribute('webkit-playsinline', 'true');
-    audio.volume = get(volume);
-    attachAudioListeners(audio);
+  if (!activeAudio) {
+    audioA = new Audio();
+    audioB = new Audio();
+
+    for (const el of [audioA, audioB]) {
+      el.preload = 'auto';
+      // Critical iOS Safari attributes for inline and background playback
+      (el as any).playsInline = true;
+      el.setAttribute('playsinline', 'true');
+      el.setAttribute('webkit-playsinline', 'true');
+      el.volume = get(volume);
+      attachAudioListeners(el);
+    }
+
+    activeAudio = audioA;
+    preloaderAudio = audioB;
+
     initMediaSessionHandlers();
+    ensureAudioKeepAlive();
   }
-  return audio;
+  return activeAudio;
 }
 
 function initMediaSessionHandlers() {
@@ -104,8 +145,8 @@ function initMediaSessionHandlers() {
       playPrev();
     });
     navigator.mediaSession.setActionHandler('seekto', d => {
-      if (audio && d.seekTime !== undefined) {
-        audio.currentTime = d.seekTime;
+      if (activeAudio && d.seekTime !== undefined) {
+        activeAudio.currentTime = d.seekTime;
       }
     });
   } catch (e) {
@@ -115,28 +156,36 @@ function initMediaSessionHandlers() {
 
 function attachAudioListeners(el: HTMLAudioElement) {
   el.addEventListener('canplay', () => {
-    isLoading.set(false);
-    loadingStatus.set('');
+    if (el === activeAudio) {
+      isLoading.set(false);
+      loadingStatus.set('');
+    }
   });
 
   el.addEventListener('playing', () => {
-    isPlaying.set(true);
-    isLoading.set(false);
-    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = 'playing';
+    if (el === activeAudio) {
+      isPlaying.set(true);
+      isLoading.set(false);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'playing';
+      }
+      // Proactively pre-resolve queue tracks while active audio keeps background JS alive
+      preloadQueue(3);
     }
-    // Proactively pre-resolve queue tracks while active audio keeps background JS alive
-    preloadQueue(3);
   });
 
   el.addEventListener('pause', () => {
-    isPlaying.set(false);
-    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = 'paused';
+    if (el === activeAudio) {
+      isPlaying.set(false);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'paused';
+      }
     }
   });
 
   el.addEventListener('timeupdate', () => {
+    // Only active playing element updates progress & triggers events
+    if (el !== activeAudio) return;
     if (!el || !el.duration || isNaN(el.duration)) return;
     const pct = el.currentTime / el.duration;
 
@@ -173,6 +222,12 @@ function attachAudioListeners(el: HTMLAudioElement) {
       );
     }
 
+    // Advance Buffer: Buffer next track audio data 15 seconds before end or at 80% progress
+    if (el.duration > 5 && (el.duration - el.currentTime <= 15 || pct > 0.8) && !advancePreloadFired) {
+      advancePreloadFired = true;
+      bufferNextTrackInAdvance();
+    }
+
     // iOS Lockscreen Safety: transition seamlessly 0.35s before end so iOS audio session does not sleep
     // Debounced with lastTransitionTime to prevent accidental double-skips
     if (el.duration > 2 && (el.duration - el.currentTime <= 0.35) && !endedTriggered && (Date.now() - lastTransitionTime > 2500)) {
@@ -182,19 +237,20 @@ function attachAudioListeners(el: HTMLAudioElement) {
   });
 
   el.addEventListener('loadedmetadata', () => {
-    if (el && !isNaN(el.duration)) {
+    if (el === activeAudio && !isNaN(el.duration)) {
       duration.set(el.duration);
     }
   });
 
   el.addEventListener('ended', () => {
-    if (!endedTriggered && (Date.now() - lastTransitionTime > 2500)) {
+    if (el === activeAudio && !endedTriggered && (Date.now() - lastTransitionTime > 2500)) {
       endedTriggered = true;
       playNext();
     }
   });
 
   el.addEventListener('error', async () => {
+    if (el !== activeAudio) return;
     if (!currentTrackSong) {
       isLoading.set(false);
       isPlaying.set(false);
@@ -221,6 +277,32 @@ function attachAudioListeners(el: HTMLAudioElement) {
     isLoading.set(false);
     isPlaying.set(false);
   });
+}
+
+function bufferNextTrackInAdvance() {
+  const q = get(queue);
+  if (!q || q.length === 0 || !preloaderAudio) return;
+  const nextSong = q[0];
+  if (!nextSong || !nextSong.id) return;
+
+  const directUrl = getCachedStreamUrl(nextSong.id) || nextSong.stream_url || nextSong.source_url;
+  if (directUrl) {
+    if (preloaderAudio.src !== directUrl) {
+      preloaderAudio.src = directUrl;
+      preloaderAudio.load();
+      preloadedSongId = nextSong.id;
+      console.log('[iOS Preloader] Pre-buffering audio bytes for next track:', nextSong.title);
+    }
+  } else {
+    getOrFetchStreamUrl(nextSong.id).then(url => {
+      if (preloaderAudio && preloaderAudio.src !== url) {
+        preloaderAudio.src = url;
+        preloaderAudio.load();
+        preloadedSongId = nextSong.id;
+        console.log('[iOS Preloader] Pre-buffering audio bytes for next track:', nextSong.title);
+      }
+    }).catch(e => console.debug('Advance preload fetch error:', e));
+  }
 }
 
 async function replenishQueueIfNeeded() {
@@ -264,7 +346,6 @@ async function getOrFetchStreamUrl(songId: string): Promise<string> {
 
 /**
  * Preloads and resolves the next few tracks in the queue without interrupting audio or WebKit context.
- * CRITICAL: Never creates secondary HTMLAudioElement instances on mobile Safari (causes lockscreen freeze).
  */
 export async function preloadQueue(depth = 3) {
   if (preloadInFlight) return;
@@ -328,7 +409,7 @@ function setupMediaSession(song: Song) {
       artwork: song.thumbnail_url
         ? [
             {
-              src: song.thumbnail_url,
+              src: song.thumbnail_url.replace('150x150', '500x500'),
               sizes: '512x512',
               type: 'image/jpeg'
             }
@@ -340,9 +421,58 @@ function setupMediaSession(song: Song) {
   }
 }
 
+function swapAndPlayPreloaded(song: Song) {
+  if (!activeAudio || !preloaderAudio) return;
+
+  completionFired = false;
+  preloadFired = false;
+  advancePreloadFired = false;
+  endedTriggered = false;
+  lastTransitionTime = Date.now();
+  retryCount = 0;
+  currentTrackSong = song;
+
+  currentSong.set(song);
+  showPlayer.set(true);
+  isLoading.set(false);
+  loadingStatus.set('');
+
+  // 1. Swap active and preloader elements
+  const oldActive = activeAudio;
+  activeAudio = preloaderAudio;
+  preloaderAudio = oldActive;
+  preloadedSongId = null;
+
+  activeAudio.volume = get(volume);
+
+  // 2. Play the pre-buffered audio element instantaneously (0ms delay)
+  const playPromise = activeAudio.play();
+  if (playPromise !== undefined) {
+    playPromise.then(() => {
+      isPlaying.set(true);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'playing';
+      }
+    }).catch(err => {
+      console.warn('Preloaded instant play error:', err);
+      isPlaying.set(false);
+    });
+  }
+
+  // 3. Reset the old active element so it can act as the preloader for the next song
+  oldActive.pause();
+  oldActive.currentTime = 0;
+  oldActive.src = '';
+
+  setupMediaSession(song);
+  recordHistoryAndPlayEvent(song);
+
+  // 4. Proactively resolve upcoming queue items
+  preloadQueue(3);
+}
+
 /**
- * Synchronous transition to a new track on the SAME audio element.
- * Crucial for iOS background & lock screen: avoids async network delays that cause WebKit to suspend execution.
+ * Direct transition to a new track on the active audio element.
  */
 function transitionToTrack(streamUrl: string, song: Song) {
   const el = getOrCreateAudio();
@@ -350,6 +480,7 @@ function transitionToTrack(streamUrl: string, song: Song) {
 
   completionFired = false;
   preloadFired = false;
+  advancePreloadFired = false;
   endedTriggered = false;
   lastTransitionTime = Date.now();
   retryCount = 0;
@@ -360,7 +491,6 @@ function transitionToTrack(streamUrl: string, song: Song) {
   isLoading.set(true);
   loadingStatus.set('');
 
-  // Re-use same audio element and trigger play synchronously
   el.src = streamUrl;
   el.loop = false;
   el.currentTime = 0;
@@ -384,7 +514,6 @@ function transitionToTrack(streamUrl: string, song: Song) {
   setupMediaSession(song);
   recordHistoryAndPlayEvent(song);
 
-  // Proactively resolve upcoming queue items immediately while audio session is hot
   preloadQueue(3);
 }
 
@@ -393,6 +522,7 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   loadingStatus.set('Loading...');
   completionFired = false;
   preloadFired = false;
+  advancePreloadFired = false;
   endedTriggered = false;
   lastTransitionTime = Date.now();
   retryCount = 0;
@@ -453,6 +583,7 @@ export function togglePlay() {
     return;
   }
   if (el.paused) {
+    ensureAudioKeepAlive();
     el.play().catch(e => console.warn('Play interrupted:', e));
     isPlaying.set(true);
     if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
@@ -480,7 +611,8 @@ export function seek(ratio: number) {
 export function setVolume(vol: number) {
   const clamped = Math.max(0, Math.min(1, vol));
   volume.set(clamped);
-  if (audio) audio.volume = clamped;
+  if (audioA) audioA.volume = clamped;
+  if (audioB) audioB.volume = clamped;
 }
 
 export async function playNext() {
@@ -517,8 +649,14 @@ export async function playNext() {
   const [next, ...rest] = q;
 
   // FAST PATH for iOS Lock Screen / Background:
-  // If next track is already cached in memory or has direct source_url, transition IMMEDIATELY (0ms delay)
-  // so iOS background WebKit never sleeps!
+  // If preloaderAudio has already buffered this track, swap immediately with 0ms delay!
+  if (preloaderAudio && (preloadedSongId === next.id || (preloaderAudio.src && preloaderAudio.src.length > 5))) {
+    queue.set(rest);
+    swapAndPlayPreloaded(next);
+    replenishQueueIfNeeded();
+    return;
+  }
+
   const directUrl = getCachedStreamUrl(next.id) || next.stream_url || next.source_url;
   if (directUrl) {
     cacheStreamUrl(next.id, directUrl);
@@ -560,7 +698,6 @@ export async function playPrev() {
 export function addToQueue(song: Song) {
   queue.update(q => [...q, song]);
   showToast(`Added to queue: ${song.title}`, 'success');
-  // Proactively cache URL for added song
   if (song.source_url || song.stream_url) {
     cacheStreamUrl(song.id, song.source_url || song.stream_url);
   }
