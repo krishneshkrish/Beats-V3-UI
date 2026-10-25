@@ -543,8 +543,10 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
     getRadio(song.id, getLocalUserId(), 15, excludeList).then(async radioSongs => {
       let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length === 0) {
-        const recList = await getRecommendations(getLocalUserId());
-        remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+        try {
+          const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList);
+          remaining = retry.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+        } catch {}
       }
       if (remaining.length === 0) {
         const trendList = await getTrending(song.genre);
@@ -555,8 +557,17 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
         preloadQueue(3);
       }
     }).catch(async () => {
-      const recList = await getRecommendations(getLocalUserId());
-      const remaining = recList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+      try {
+        const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList);
+        const remaining = retry.filter(s => s.id !== song.id && !excludeList.includes(s.id));
+        if (remaining.length > 0) {
+          queue.set(remaining);
+          preloadQueue(3);
+          return;
+        }
+      } catch {}
+      const trendList = await getTrending(song.genre);
+      const remaining = trendList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length > 0) {
         queue.set(remaining.slice(0, 10));
         preloadQueue(3);

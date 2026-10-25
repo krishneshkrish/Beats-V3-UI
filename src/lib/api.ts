@@ -132,7 +132,7 @@ export async function getSongs(genre?: string, limit = 20): Promise<Song[]> {
     const url = genre && genre !== 'all'
       ? `${API_BASE}/api/songs?genre=${encodeURIComponent(genre)}&limit=${limit}`
       : `${API_BASE}/api/songs?limit=${limit}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     if (Array.isArray(data.songs) && data.songs.length > 0) {
@@ -198,7 +198,7 @@ export async function searchSongs(query: string, limit = 20): Promise<Song[]> {
   try {
     const r = await fetch(
       `${API_BASE}/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
-      { signal: AbortSignal.timeout(8000) }
+      { signal: AbortSignal.timeout(25000) }
     );
     if (r.ok) {
       const data = await r.json();
@@ -233,7 +233,7 @@ export async function resolveStream(
 ): Promise<{ stream_url: string; title: string; artist: string }> {
   try {
     const r = await fetch(`${API_BASE}/api/resolve/${encodeURIComponent(songId)}`, {
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(25000)
     });
     if (r.ok) {
       const data = await r.json();
@@ -264,7 +264,7 @@ export async function getTrending(genre?: string): Promise<Song[]> {
     const url = genre && genre !== 'all'
       ? `${API_BASE}/api/trending?genre=${encodeURIComponent(genre)}`
       : `${API_BASE}/api/trending`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
     if (r.ok) {
       const data = await r.json();
       const songs = normalizeSongList(data);
@@ -291,7 +291,7 @@ export type RecommendedSongs = Song[] & {
 export async function getRecommendations(userId: string): Promise<RecommendedSongs> {
   try {
     const url = `${API_BASE}/api/recommendations?user_id=${encodeURIComponent(userId)}&limit=20`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
     if (r.ok) {
       const data = await r.json();
       const songs = normalizeSongList(data);
@@ -319,7 +319,7 @@ export async function getRadio(
   try {
     const excludeParam = excludeIds.length > 0 ? `&exclude=${encodeURIComponent(excludeIds.join(','))}` : '';
     const url = `${API_BASE}/api/radio/${encodeURIComponent(songId)}?user_id=${encodeURIComponent(userId)}&limit=${limit}${excludeParam}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
     if (r.ok) {
       const data = await r.json();
       const songs = normalizeSongList(data);
@@ -393,7 +393,7 @@ export async function getUserStats(userId: string): Promise<UserStats | null> {
   // 1. Try dedicated stats endpoint
   try {
     const r = await fetch(`${API_BASE}/api/user/${encodeURIComponent(userId)}/stats`, {
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(25000)
     });
     if (r.ok) {
       const data = await r.json();
