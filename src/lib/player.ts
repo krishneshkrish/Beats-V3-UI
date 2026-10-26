@@ -34,6 +34,38 @@ let retryCount = 0;
 let isReplenishing = false;
 let preloadInFlight = false;
 
+// Stall & buffer recovery watchdog
+let stallWatchdogTimer: any = null;
+
+function clearStallWatchdog() {
+  if (stallWatchdogTimer) {
+    clearTimeout(stallWatchdogTimer);
+    stallWatchdogTimer = null;
+  }
+}
+
+function startStallWatchdog(reason = 'stall') {
+  clearStallWatchdog();
+  stallWatchdogTimer = setTimeout(() => {
+    console.warn(`[Watchdog] Audio stalled for 10s (${reason}), auto-advancing:`, currentTrackSong?.title);
+    if (currentTrackSong) {
+      invalidateStream(currentTrackSong.id);
+    }
+    isLoading.set(false);
+    playNext();
+  }, 10000);
+}
+
+function safeResetAudio(el: HTMLAudioElement | null) {
+  if (!el) return;
+  try {
+    el.pause();
+    el.currentTime = 0;
+    el.removeAttribute('src');
+    el.load();
+  } catch {}
+}
+
 let cachedSynthesizedTrack: string | null = null;
 
 function ensureAudioKeepAlive() {
@@ -167,15 +199,34 @@ function initMediaSessionHandlers() {
 function attachAudioListeners(el: HTMLAudioElement) {
   el.addEventListener('canplay', () => {
     if (el === activeAudio) {
+      clearStallWatchdog();
       isLoading.set(false);
       loadingStatus.set('');
     }
   });
 
+  el.addEventListener('waiting', () => {
+    if (el === activeAudio) {
+      isLoading.set(true);
+      loadingStatus.set('Buffering...');
+      startStallWatchdog('waiting');
+    }
+  });
+
+  el.addEventListener('stalled', () => {
+    if (el === activeAudio) {
+      isLoading.set(true);
+      loadingStatus.set('Buffering...');
+      startStallWatchdog('stalled');
+    }
+  });
+
   el.addEventListener('playing', () => {
     if (el === activeAudio) {
+      clearStallWatchdog();
       isPlaying.set(true);
       isLoading.set(false);
+      loadingStatus.set('');
       if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
         navigator.mediaSession.playbackState = 'playing';
       }
@@ -196,6 +247,7 @@ function attachAudioListeners(el: HTMLAudioElement) {
   el.addEventListener('timeupdate', () => {
     // Only active playing element updates progress & triggers events
     if (el !== activeAudio) return;
+    clearStallWatchdog();
     if (!el || !el.duration || isNaN(el.duration)) return;
     const pct = el.currentTime / el.duration;
 
@@ -260,7 +312,14 @@ function attachAudioListeners(el: HTMLAudioElement) {
   });
 
   el.addEventListener('error', async () => {
+    if (el === preloaderAudio) {
+      console.warn('[Preloader Error] Preloading failed for song ID:', preloadedSongId);
+      preloadedSongId = null;
+      safeResetAudio(el);
+      return;
+    }
     if (el !== activeAudio) return;
+    clearStallWatchdog();
     if (!currentTrackSong) {
       isLoading.set(false);
       isPlaying.set(false);
@@ -446,6 +505,7 @@ function setupMediaSession(song: Song) {
 function swapAndPlayPreloaded(song: Song) {
   if (!activeAudio || !preloaderAudio) return;
 
+  clearStallWatchdog();
   completionFired = false;
   preloadFired = false;
   advancePreloadFired = false;
@@ -476,15 +536,20 @@ function swapAndPlayPreloaded(song: Song) {
         navigator.mediaSession.playbackState = 'playing';
       }
     }).catch(err => {
-      console.warn('Preloaded instant play error:', err);
-      isPlaying.set(false);
+      console.warn('Preloaded instant play error, falling back to direct transition:', err);
+      // Resilience: Never leave player frozen. Recover fresh stream or advance queue
+      invalidateStream(song.id);
+      getOrFetchStreamUrl(song.id).then(freshUrl => {
+        transitionToTrack(freshUrl, song);
+      }).catch(fallbackErr => {
+        console.error('Preloaded recovery failed, auto-advancing:', fallbackErr);
+        playNext();
+      });
     });
   }
 
-  // 3. Reset the old active element so it can act as the preloader for the next song
-  oldActive.pause();
-  oldActive.currentTime = 0;
-  oldActive.src = '';
+  // 3. Safely reset the old active element so it can act as the preloader for the next song
+  safeResetAudio(oldActive);
 
   setupMediaSession(song);
   recordHistoryAndPlayEvent(song);
@@ -500,6 +565,7 @@ function transitionToTrack(streamUrl: string, song: Song) {
   const el = getOrCreateAudio();
   if (!el) return;
 
+  clearStallWatchdog();
   completionFired = false;
   preloadFired = false;
   advancePreloadFired = false;
@@ -511,7 +577,8 @@ function transitionToTrack(streamUrl: string, song: Song) {
   currentSong.set(song);
   showPlayer.set(true);
   isLoading.set(true);
-  loadingStatus.set('');
+  loadingStatus.set('Buffering...');
+  startStallWatchdog('transition');
 
   el.src = streamUrl;
   el.loop = false;
@@ -521,15 +588,26 @@ function transitionToTrack(streamUrl: string, song: Song) {
   const playPromise = el.play();
   if (playPromise !== undefined) {
     playPromise.then(() => {
+      clearStallWatchdog();
       isPlaying.set(true);
       isLoading.set(false);
+      loadingStatus.set('');
       if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
         navigator.mediaSession.playbackState = 'playing';
       }
     }).catch(err => {
       console.warn('Playback gesture required or auto-blocked:', err);
+      clearStallWatchdog();
       isLoading.set(false);
       isPlaying.set(false);
+      // If error was unplayable media source or broken link, advance queue
+      if (err.name === 'NotSupportedError' || (el.error && el.error.code !== 0)) {
+        invalidateStream(song.id);
+        const q = get(queue);
+        if (q && q.length > 0) {
+          playNext();
+        }
+      }
     });
   }
 
@@ -540,6 +618,7 @@ function transitionToTrack(streamUrl: string, song: Song) {
 }
 
 export async function playSong(song: Song, upcomingQueue?: Song[]) {
+  clearStallWatchdog();
   isLoading.set(true);
   loadingStatus.set('Loading...');
   completionFired = false;
@@ -551,6 +630,10 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   currentSong.set(song);
   showPlayer.set(true);
 
+  // Clean slate: reset preloader on direct song playback
+  preloadedSongId = null;
+  safeResetAudio(preloaderAudio);
+
   if (song.source_url || song.stream_url) {
     cacheStreamUrl(song.id, song.source_url || song.stream_url);
   }
@@ -558,6 +641,9 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   if (upcomingQueue !== undefined && upcomingQueue.length > 0) {
     queue.set(upcomingQueue.filter(s => s.id !== song.id));
     preloadQueue(3);
+    replenishQueueIfNeeded();
+  } else if (upcomingQueue !== undefined && upcomingQueue.length === 0) {
+    // Explicit empty queue was passed: replenish immediately
     replenishQueueIfNeeded();
   } else {
     // Zero-friction Up Next: Seed infinite smart radio
@@ -603,6 +689,7 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
   } catch (e) {
     console.error('Play error:', e);
     showToast(`Could not load "${song.title}", skipping...`, 'error');
+    invalidateStream(song.id);
     isLoading.set(false);
     isPlaying.set(false);
     const q = get(queue);
@@ -653,6 +740,7 @@ export function setVolume(vol: number) {
 }
 
 export async function playNext() {
+  clearStallWatchdog();
   const q = get(queue);
   if (q.length === 0) {
     const cur = get(currentSong);
@@ -664,7 +752,7 @@ export async function playNext() {
       if (candidates.length > 0) {
         const [next, ...rest] = candidates;
         queue.set(rest);
-        await playSong(next);
+        await playSong(next, rest);
         replenishQueueIfNeeded();
         return;
       }
@@ -675,7 +763,7 @@ export async function playNext() {
       if (candidates.length > 0) {
         const [next, ...rest] = candidates;
         queue.set(rest);
-        await playSong(next);
+        await playSong(next, rest);
         replenishQueueIfNeeded();
         return;
       }
@@ -686,13 +774,22 @@ export async function playNext() {
   const [next, ...rest] = q;
 
   // FAST PATH for iOS Lock Screen / Background:
-  // If preloaderAudio has already buffered this track, swap immediately with 0ms delay!
-  if (preloaderAudio && (preloadedSongId === next.id || (preloaderAudio.src && preloaderAudio.src.length > 5))) {
+  // ONLY use preloaderAudio if it specifically loaded THIS EXACT next.id AND has valid buffer without errors!
+  if (
+    preloaderAudio &&
+    preloadedSongId === next.id &&
+    !preloaderAudio.error &&
+    preloaderAudio.readyState >= 2
+  ) {
     queue.set(rest);
     swapAndPlayPreloaded(next);
     replenishQueueIfNeeded();
     return;
   }
+
+  // Preloader not ready or mismatched: reset preloader to prevent stale audio contamination
+  safeResetAudio(preloaderAudio);
+  preloadedSongId = null;
 
   const directUrl = getCachedStreamUrl(next.id) || next.stream_url || next.source_url;
   if (directUrl) {
@@ -705,15 +802,21 @@ export async function playNext() {
 
   // Fallback if cache missed
   try {
+    isLoading.set(true);
+    loadingStatus.set('Loading next track...');
     const fullStreamUrl = await getOrFetchStreamUrl(next.id);
     queue.set(rest);
     transitionToTrack(fullStreamUrl, next);
     replenishQueueIfNeeded();
   } catch (err) {
     console.error('playNext fallback error for:', next.title, err);
+    invalidateStream(next.id);
     if (rest.length > 0) {
       queue.set(rest);
       playNext();
+    } else {
+      isLoading.set(false);
+      isPlaying.set(false);
     }
   }
 }

@@ -270,8 +270,8 @@
             {#each $queue.slice(0, 10) as item, i (item.id)}
               <div
                 class="tape-card"
-                on:click={() => jumpToQueueSong(item, i)}
-                on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jumpToQueueSong(item, i); } }}
+                on:click|stopPropagation={() => jumpToQueueSong(item, i)}
+                on:keydown|stopPropagation={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jumpToQueueSong(item, i); } }}
                 role="button"
                 tabindex="0"
               >
