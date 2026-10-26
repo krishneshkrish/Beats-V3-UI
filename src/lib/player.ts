@@ -144,6 +144,16 @@ function initMediaSessionHandlers() {
     navigator.mediaSession.setActionHandler('previoustrack', () => {
       playPrev();
     });
+    // Explicitly nullify seekforward and seekbackward on iOS.
+    // iOS WebKit defaults to 10-second skip buttons [↺ 10] [↻ 10] if these are active or not explicitly disabled.
+    // Setting them to null forces iOS lockscreen & Control Center to render [|<<] and [>>|] track skip buttons.
+    try {
+      navigator.mediaSession.setActionHandler('seekforward', null);
+    } catch {}
+    try {
+      navigator.mediaSession.setActionHandler('seekbackward', null);
+    } catch {}
+
     navigator.mediaSession.setActionHandler('seekto', d => {
       if (activeAudio && d.seekTime !== undefined) {
         activeAudio.currentTime = d.seekTime;
@@ -256,7 +266,16 @@ function attachAudioListeners(el: HTMLAudioElement) {
       isPlaying.set(false);
       return;
     }
+    console.warn('[Audio Error] Failed to play track:', currentTrackSong.title);
     invalidateStream(currentTrackSong.id);
+
+    const q = get(queue);
+    if (q && q.length > 0) {
+      console.log('[Audio Error] Auto-advancing to next song in queue...');
+      playNext();
+      return;
+    }
+
     if (retryCount < 1) {
       retryCount++;
       const synthUrl = getSynthesizedTrackUrl();
@@ -416,6 +435,9 @@ function setupMediaSession(song: Song) {
           ]
         : []
     });
+
+    // Re-affirm next/prev and nullify seek buttons on track change for iOS lockscreen
+    initMediaSessionHandlers();
   } catch (e) {
     console.debug('MediaSession registration error:', e);
   }
@@ -580,9 +602,13 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
     transitionToTrack(fullStreamUrl, song);
   } catch (e) {
     console.error('Play error:', e);
-    showToast('Could not load song', 'error');
+    showToast(`Could not load "${song.title}", skipping...`, 'error');
     isLoading.set(false);
     isPlaying.set(false);
+    const q = get(queue);
+    if (q && q.length > 0) {
+      playNext();
+    }
   }
 }
 
