@@ -314,11 +314,16 @@ export async function getRadio(
   songId: string,
   userId = 'guest',
   limit = 15,
-  excludeIds: string[] = []
+  excludeIds: string[] = [],
+  language?: string,
+  genre?: string
 ): Promise<Song[]> {
+  const targetLang = (language || genre || '').trim().toLowerCase();
   try {
     const excludeParam = excludeIds.length > 0 ? `&exclude=${encodeURIComponent(excludeIds.join(','))}` : '';
-    const url = `${API_BASE}/api/radio/${encodeURIComponent(songId)}?user_id=${encodeURIComponent(userId)}&limit=${limit}${excludeParam}`;
+    const langParam = targetLang && targetLang !== 'mix' ? `&language=${encodeURIComponent(targetLang)}` : '';
+    const genreParam = genre && genre !== 'mix' ? `&genre=${encodeURIComponent(genre)}` : '';
+    const url = `${API_BASE}/api/radio/${encodeURIComponent(songId)}?user_id=${encodeURIComponent(userId)}&limit=${limit}${excludeParam}${langParam}${genreParam}`;
     const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
     if (r.ok) {
       const data = await r.json();
@@ -331,7 +336,16 @@ export async function getRadio(
     console.warn('Radio endpoint error, falling back:', err);
   }
 
-  // Resilient fallback: Query live recommendations or trending songs, never static dummy songs
+  // Resilient fallback with STRICT linguistic integrity:
+  // If targetLang is known (e.g. malayalam), fall back to trending in that language, NEVER cross-language user recs!
+  if (targetLang && targetLang !== 'mix') {
+    try {
+      const trend = await getTrending(targetLang);
+      const valid = trend.filter(s => s.id !== songId && !excludeIds.includes(s.id));
+      if (valid.length > 0) return valid;
+    } catch {}
+  }
+
   try {
     const recs = await getRecommendations(userId);
     const valid = recs.filter(s => s.id !== songId && !excludeIds.includes(s.id));

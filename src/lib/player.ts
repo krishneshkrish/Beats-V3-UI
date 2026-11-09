@@ -391,7 +391,7 @@ async function replenishQueueIfNeeded() {
     isReplenishing = true;
     try {
       const existingIds = [cur.id, ...q.map(s => s.id), ...get(history).map(s => s.id)];
-      const more = await getRadio(cur.id, getLocalUserId(), 12, existingIds);
+      const more = await getRadio(cur.id, getLocalUserId(), 12, existingIds, cur.language, cur.genre);
       const candidates = more.filter(s => !existingIds.includes(s.id));
       if (candidates.length > 0) {
         queue.update(currentQ => [...currentQ, ...candidates]);
@@ -646,18 +646,19 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
     // Explicit empty queue was passed: replenish immediately
     replenishQueueIfNeeded();
   } else {
-    // Zero-friction Up Next: Seed infinite smart radio
+    // Zero-friction Up Next: Seed infinite smart radio with strict linguistic filtering
     const excludeList = [song.id, ...get(history).map(s => s.id)];
-    getRadio(song.id, getLocalUserId(), 15, excludeList).then(async radioSongs => {
+    const songLang = song.language || song.genre;
+    getRadio(song.id, getLocalUserId(), 15, excludeList, song.language, song.genre).then(async radioSongs => {
       let remaining = radioSongs.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length === 0) {
         try {
-          const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList);
+          const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList, song.language, song.genre);
           remaining = retry.filter(s => s.id !== song.id && !excludeList.includes(s.id));
         } catch {}
       }
       if (remaining.length === 0) {
-        const trendList = await getTrending(song.genre);
+        const trendList = await getTrending(songLang);
         remaining = trendList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       }
       if (remaining.length > 0) {
@@ -666,7 +667,7 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
       }
     }).catch(async () => {
       try {
-        const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList);
+        const retry = await getRadio(song.id, getLocalUserId(), 15, excludeList, song.language, song.genre);
         const remaining = retry.filter(s => s.id !== song.id && !excludeList.includes(s.id));
         if (remaining.length > 0) {
           queue.set(remaining);
@@ -674,7 +675,7 @@ export async function playSong(song: Song, upcomingQueue?: Song[]) {
           return;
         }
       } catch {}
-      const trendList = await getTrending(song.genre);
+      const trendList = await getTrending(songLang);
       const remaining = trendList.filter(s => s.id !== song.id && !excludeList.includes(s.id));
       if (remaining.length > 0) {
         queue.set(remaining.slice(0, 10));
